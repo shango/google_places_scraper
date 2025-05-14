@@ -1,69 +1,76 @@
-import requests, time, os, csv, pandas as pd
-from tqdm import tqdm
-
-API_KEY = os.getenv("GOOGLE_API_KEY") # Ensure you have set your Google API key in your environment variables
-
-if not API_KEY:
-    raise EnvironmentError("GOOGLE_API_KEY not set in environment variables")
-
 # -------------------------
 # CONFIGURATION CONSTANTS
 # -------------------------
 
-# Population thresholds
-POPULATION_MIN_THRESHOLD = 100_000         # Skip cities below this
-POPULATION_PAGINATION_MIN = 1_000_000      # Enable 3-page search for cities in this range
+POPULATION_MIN_THRESHOLD = 100_000
+POPULATION_PAGINATION_MIN = 1_000_000
 POPULATION_PAGINATION_MAX = 5_000_000
-POPULATION_GRID_SEARCH_MIN = 5_000_001     # Use grid search for cities above this
+POPULATION_GRID_SEARCH_MIN = 5_000_001
 
-# Google Places search config
-SEARCH_RADIUS_METERS = 5000                # Max 50,000; API max is 50km
-GRID_STEP_DEGREES = 0.045                  # ~5 km resolution (smaller = finer grid)
+SEARCH_RADIUS_METERS = 5000
+GRID_STEP_DEGREES = 0.045  # Approx ~5km
 
-# Deduplication & result control
-MAX_RESULTS_PER_CITY = 60                  # Cap total results stored per city
-ENABLE_DEDUPLICATION = True                # Track and skip repeated place_ids
+MAX_RESULTS_PER_CITY = 60
+ENABLE_DEDUPLICATION = True
 
-# Logging and debugging
-ENABLE_LOGGING = True                      # Save skipped or error cities to log file
+ENABLE_LOGGING = True
 LOG_FILE_PATH = "logs/skipped_cities.log"
-SAVE_RESULTS_TO_JSON = True                # Optional: Save raw results per city
+SAVE_RESULTS_TO_JSON = True
 RESULTS_JSON_DIR = "json_results/"
 
-# Testing and limits
-ENABLE_TEST_MODE = False                   # Set to True to limit execution for test runs
-TEST_CITY_LIMIT = 5                        # Number of cities to run in test mode
+ENABLE_TEST_MODE = False
+TEST_CITY_LIMIT = 5
+
+CITY_DATA_FILE_PATH = "us_all_cities_sample.xlsx"  # Configurable path to Excel input
 
 # -------------------------
+# IMPORTS AND SETUP
+# -------------------------
 
-# Load US city/town coordinates from Excel
-df = pd.read_excel("us_all_cities_sample.xlsx")
+import os
+import time
+import json
+import requests
+import pandas as pd
+from tqdm import tqdm
 
-# Convert to list of dicts for use in API loop
-us_places = df.to_dict(orient='records')
+API_KEY = os.getenv("GOOGLE_API_KEY")
+if not API_KEY:
+    raise EnvironmentError("GOOGLE_API_KEY not set in environment variables")
 
-# Function to handle API requests with retries
-def safe_get(url, params):
-    for attempt in range(3):
-        try:
-            return requests.get(url, params=params, timeout=10).json()
-        except requests.exceptions.RequestException as e:
-            print(f"API error: {e}. Retrying ({attempt + 1}/3)...")
-            time.sleep(2)
-    return {}
+# -------------------------
+# DATA LOAD AND INITIALIZATION
+# -------------------------
 
-# Function to safely get JSON data from the API
-def safe_get_json(url, params):
-    for attempt in range(3):
-        try:
-            return requests.get(url, params=params, timeout=10).json()
-        except requests.exceptions.RequestException as e:
-            print(f"API error: {e}. Retrying ({attempt + 1}/3)...")
-            time.sleep(2)
-    return {}
+os.makedirs("images", exist_ok=True)
+os.makedirs("logs", exist_ok=True)
+os.makedirs(RESULTS_JSON_DIR, exist_ok=True)
 
-# Function to search for places
-def search_places(location, radius, api_key):
+seen_place_ids = set()
+results = []
+
+# Load city data
+city_df = pd.read_excel(CITY_DATA_FILE_PATH)
+if ENABLE_TEST_MODE:
+    city_df = city_df.head(TEST_CITY_LIMIT)
+us_places = city_df.to_dict(orient="records")
+
+# -------------------------
+# HELPER FUNCTIONS
+# -------------------------
+
+def log_skip(place, reason):
+    if ENABLE_LOGGING:
+        with open(LOG_FILE_PATH, "a") as f:
+            f.write(f"{place['city']}, {place['state']} — {reason}\n")
+
+def save_raw_json(city_name, data):
+    if SAVE_RESULTS_TO_JSON:
+        file_path = os.path.join(RESULTS_JSON_DIR, f"{city_name.replace(' ', '_')}.json")
+        with open(file_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+def search_places(location, radius, api_key, page_token=None):
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
     params = {
         "query": "ramen",
@@ -71,9 +78,10 @@ def search_places(location, radius, api_key):
         "radius": radius,
         "key": api_key
     }
+    if page_token:
+        params["pagetoken"] = page_token
     return requests.get(url, params=params).json()
 
-# Function to get place details
 def get_place_details(place_id, api_key):
     url = "https://maps.googleapis.com/maps/api/place/details/json"
     params = {
@@ -81,62 +89,106 @@ def get_place_details(place_id, api_key):
         "fields": "name,formatted_address,formatted_phone_number,rating,geometry,website,url",
         "key": api_key
     }
-    return safe_get_json(url, params=params).json()
+    return requests.get(url, params=params).json()
 
-# Function to generate a Street View image URL
 def get_street_view_url(lat, lng, api_key, size="600x300"):
     return f"https://maps.googleapis.com/maps/api/streetview?size={size}&location={lat},{lng}&key={api_key}"
 
-# Loop through each city/town and search for ramen places
-results = []
+def fetch_with_pagination(location):
+    all_results = []
+    response = search_places(location, SEARCH_RADIUS_METERS, API_KEY)
+    all_results.extend(response.get("results", []))
+    token = response.get("next_page_token")
 
-for place in tqdm(us_places, desc="Searching locations"):
-    location = f"{place['lat']},{place['lng']}"
-    print(f"Searching in: {place['city']}, {place['state']} {place['zipcode']}")
-    response = search_places(location, 5000, API_KEY)
-    
-    if "error_message" in response:
-        print(f"API error for {place['city']}, {place['state']}: {response['error_message']}")
-        time.sleep(10)
+    for _ in range(2):
+        if not token:
+            break
+        time.sleep(2)
+        paged_response = search_places(location, SEARCH_RADIUS_METERS, API_KEY, page_token=token)
+        all_results.extend(paged_response.get("results", []))
+        token = paged_response.get("next_page_token")
+
+    return all_results, response.get("error_message")
+
+def generate_grid(center_lat, center_lng):
+    offsets = [-GRID_STEP_DEGREES, 0, GRID_STEP_DEGREES]
+    return [(center_lat + dx, center_lng + dy) for dx in offsets for dy in offsets]
+
+def fetch_grid(place):
+    all_results = []
+    for lat, lng in generate_grid(place["lat"], place["lng"]):
+        location = f"{lat},{lng}"
+        response = search_places(location, SEARCH_RADIUS_METERS, API_KEY)
+        all_results.extend(response.get("results", []))
+        time.sleep(2)
+    return all_results
+
+# -------------------------
+# MAIN EXECUTION LOOP
+# -------------------------
+
+for place in tqdm(us_places, desc="Processing cities"):
+    pop = place.get("population", 0)
+    if pop < POPULATION_MIN_THRESHOLD:
+        log_skip(place, "Population below threshold")
         continue
 
-    for result in response.get("results", []):
+    location = f"{place['lat']},{place['lng']}"
+
+    if POPULATION_PAGINATION_MIN <= pop <= POPULATION_PAGINATION_MAX:
+        raw_results, error = fetch_with_pagination(location)
+    elif pop >= POPULATION_GRID_SEARCH_MIN:
+        raw_results = fetch_grid(place)
+        error = None
+    else:
+        response = search_places(location, SEARCH_RADIUS_METERS, API_KEY)
+        raw_results = response.get("results", [])
+        error = response.get("error_message")
+
+    if error:
+        log_skip(place, f"API error: {error}")
+        continue
+
+    if not raw_results:
+        log_skip(place, "No results returned")
+        continue
+
+    save_raw_json(place["city"], raw_results)
+
+    for result in raw_results:
         place_id = result.get("place_id")
+        if ENABLE_DEDUPLICATION and place_id in seen_place_ids:
+            continue
+        seen_place_ids.add(place_id)
+
         details = get_place_details(place_id, API_KEY).get("result", {})
-        name = details.get("name")
-        address = details.get("formatted_address")
-        phone = details.get("formatted_phone_number")
-        rating = details.get("rating")
         lat = details.get("geometry", {}).get("location", {}).get("lat")
         lng = details.get("geometry", {}).get("location", {}).get("lng")
-        website = details.get("website")
-        street_view_url = get_street_view_url(lat, lng, API_KEY)
-        maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
 
         results.append({
             "City": place["city"],
-            "Name": name,
-            "Address": address,
             "State": place["state"],
             "Zip": place.get("zipcode", ""),
-            "Country": "USA",
-            "Phone": phone,
-            "Rating": rating,
+            "Name": details.get("name"),
+            "Address": details.get("formatted_address"),
+            "Phone": details.get("formatted_phone_number"),
+            "Rating": details.get("rating"),
             "Latitude": lat,
             "Longitude": lng,
-            "Website": website,
-            "Maps URL": maps_url,
-            "Street View URL": street_view_url,
-            
+            "Website": details.get("website"),
+            "Maps URL": f"https://www.google.com/maps/search/?api=1&query={lat},{lng}",
+            "Street View URL": get_street_view_url(lat, lng, API_KEY),
         })
-        time.sleep(2)  # Avoid hitting rate limits
 
-# Finalize file path
+        if len(results) >= MAX_RESULTS_PER_CITY:
+            break
+
+# -------------------------
+# SAVE FINAL OUTPUT
+# -------------------------
+
+output_df = pd.DataFrame(results)
 script_dir = os.path.dirname(os.path.abspath(__file__))
 excel_path = os.path.join(script_dir, "ramen_shops_usa.xlsx")
-
-# Save to Excel
-results_df = pd.DataFrame(results)
-results_df.to_excel(excel_path, index=False)
-
+output_df.to_excel(excel_path, index=False)
 print(f"Excel file saved at: {excel_path}")
